@@ -1,4 +1,5 @@
 use bevy::app::App;
+use bevy::color::palettes::css::{ORANGE, RED};
 use bevy::prelude::*;
 use rand;
 use rand::Rng;
@@ -19,6 +20,9 @@ fn main() {
                 despawn_bubbles,
                 move_ship,
                 draw_ship,
+                spawn_enemies,
+                draw_enemies,
+                check_bubble_enemy_collision,
             ),
         )
         .run();
@@ -45,6 +49,19 @@ struct Bubble {
 
 #[derive(Component)]
 struct Ship;
+
+#[derive(Component)]
+struct Enemy {
+    health: f32,
+    variant: EnemyVariant,
+}
+
+#[derive(Component)]
+enum EnemyVariant {
+    Floater,
+    Seeker,
+    // Add more variants as we implement them
+}
 
 fn random_pastel_color() -> Color {
     let mut rng = rand::thread_rng();
@@ -94,7 +111,7 @@ fn spawn_bubble(
 
 fn move_bubbles(mut query: Query<(&mut Transform, &Velocity)>, time: Res<Time>) {
     for (mut transform, velocity) in &mut query {
-        transform.translation += velocity.0.extend(0.0) * time.delta().as_secs_f32();
+        transform.translation += velocity.0.extend(0.0) * time.delta_secs()
     }
 }
 
@@ -193,7 +210,7 @@ fn move_ship(
         acceleration.x += 1.0;
     }
 
-    let dt = time.delta().as_secs_f32();
+    let dt = time.delta_secs();
 
     if acceleration != Vec2::ZERO {
         acceleration = acceleration.normalize() * acceleration_rate * dt;
@@ -244,4 +261,74 @@ fn draw_ship(mut gizmos: Gizmos, query: Query<&Transform, With<Ship>>, mouse: Re
         rect_center + to_mouse * rect_length / 2.0,
         Color::WHITE,
     );
+}
+
+fn spawn_enemies(mut commands: Commands, time: Res<Time>, window_query: Query<&Window>) {
+    let window = window_query.single();
+    let mut rng = rand::thread_rng();
+
+    // Spawn every few seconds
+    if time.elapsed_secs() % 3.0 < time.delta_secs() {
+        let x = rng.gen_range(-window.width() / 2.0..window.width() / 2.0);
+        let y = rng.gen_range(-window.height() / 2.0..window.height() / 2.0);
+
+        commands.spawn((
+            Enemy {
+                health: 100.0,
+                variant: EnemyVariant::Floater,
+            },
+            Transform::from_xyz(x, y, 0.0),
+            Velocity(Vec2::new(
+                rng.gen_range(-50.0..50.0),
+                rng.gen_range(-50.0..50.0),
+            )),
+        ));
+    }
+}
+
+fn draw_enemies(mut gizmos: Gizmos, query: Query<(&Transform, &Enemy)>) {
+    for (transform, enemy) in &query {
+        let pos = transform.translation.truncate();
+        match enemy.variant {
+            EnemyVariant::Floater => {
+                // Draw red circle for floaters
+                gizmos.circle_2d(pos, 20.0, RED);
+            }
+            EnemyVariant::Seeker => {
+                // Draw orange triangle for seekers
+                let points = [
+                    pos + Vec2::new(0.0, 20.0),
+                    pos + Vec2::new(-17.3, -10.0),
+                    pos + Vec2::new(17.3, -10.0),
+                ];
+                gizmos.linestrip_2d(points, ORANGE);
+            }
+        }
+    }
+}
+
+fn check_bubble_enemy_collision(
+    mut commands: Commands,
+    bubble_query: Query<(Entity, &Transform), With<Bubble>>,
+    mut enemy_query: Query<(Entity, &Transform, &mut Enemy)>,
+) {
+    for (bubble_entity, bubble_transform) in bubble_query.iter() {
+        let bubble_pos = bubble_transform.translation.truncate();
+
+        for (enemy_entity, enemy_transform, mut enemy) in enemy_query.iter_mut() {
+            let enemy_pos = enemy_transform.translation.truncate();
+
+            if bubble_pos.distance(enemy_pos) < 30.0 {
+                // Adjust collision radius as needed
+                enemy.health -= 25.0; // Damage from bubble
+                commands.entity(bubble_entity).despawn();
+
+                if enemy.health <= 0.0 {
+                    commands.entity(enemy_entity).despawn();
+                }
+
+                break; // Bubble can only hit one enemy
+            }
+        }
+    }
 }
