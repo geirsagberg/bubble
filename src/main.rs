@@ -50,7 +50,6 @@ const ENEMY_MIN_SCALE: f32 = 0.1;
 
 // Add at the top with other constants
 const ENEMY_SPAWN_MARGIN: f32 = 100.0; // Keep enemies away from borders on spawn
-const ENEMY_BOUNCE_FORCE: f32 = 300.0;
 
 // Add velocity scaling constants
 const ENEMY_SPEED_SCALE_TIME: f32 = 60.0; // Time in seconds to reach max speed
@@ -119,6 +118,10 @@ const MAX_BUBBLE_SUPPLY: f32 = 100.0;
 #[derive(Resource, Deref, DerefMut)]
 struct DeathTimer(Timer);
 
+// Add drip timer resource
+#[derive(Resource, Deref, DerefMut)]
+struct DripTimer(Timer);
+
 // Add exit system
 fn handle_exit(keyboard: Res<ButtonInput<KeyCode>>, mut app_exit_events: EventWriter<AppExit>) {
     if keyboard.just_pressed(KeyCode::Escape) {
@@ -134,6 +137,9 @@ struct GameOverUI;
 #[derive(Resource, Default)]
 struct GameAudio {
     bubble_shoot: Handle<AudioSource>,
+    pop: Handle<AudioSource>,
+    bounce: Handle<AudioSource>,
+    drip: Handle<AudioSource>,
 }
 
 // Add shooting state component
@@ -174,6 +180,18 @@ impl Default for EnemySpeed {
     }
 }
 
+// Add enemy destroyed event
+#[derive(Event)]
+struct EnemyDestroyed;
+
+// Add ship bounce event
+#[derive(Event)]
+struct ShipBounced;
+
+// Add enemy hit event
+#[derive(Event)]
+struct EnemyHit;
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
@@ -181,7 +199,11 @@ fn main() {
         .insert_resource(StartingTimer(Timer::from_seconds(1.0, TimerMode::Once)))
         .insert_resource(EnemySpawnTimer::default())
         .insert_resource(DeathTimer(Timer::from_seconds(1.0, TimerMode::Once)))
+        .insert_resource(DripTimer(Timer::from_seconds(0.05, TimerMode::Repeating)))
         .add_event::<BubbleShot>()
+        .add_event::<EnemyDestroyed>()
+        .add_event::<ShipBounced>()
+        .add_event::<EnemyHit>()
         .add_systems(Startup, setup)
         .insert_resource(ClearColor(Color::BLACK))
         .insert_resource(Mouse::default())
@@ -206,6 +228,9 @@ fn main() {
                 handle_enemy_border,
                 update_shooting_state,
                 handle_bubble_sound,
+                handle_enemy_death_sound,
+                handle_ship_bounce_sound,
+                handle_enemy_hit_sound,
             )
                 .run_if(in_state(GameState::Playing)),
         )
@@ -252,6 +277,9 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     // Load and store audio assets
     commands.insert_resource(GameAudio {
         bubble_shoot: asset_server.load("sounds/bubble.wav"),
+        pop: asset_server.load("sounds/pop.wav"),
+        bounce: asset_server.load("sounds/bounce.wav"),
+        drip: asset_server.load("sounds/drip.wav"),
     });
 }
 
@@ -813,6 +841,8 @@ fn check_bubble_enemy_collision(
     mut commands: Commands,
     bubble_query: Query<(Entity, &Transform), With<Bubble>>,
     mut enemy_query: Query<(Entity, &Transform, &mut Enemy, Option<&Growing>)>,
+    mut enemy_destroyed: EventWriter<EnemyDestroyed>,
+    mut enemy_hit: EventWriter<EnemyHit>,
 ) {
     let mut destroyed_enemies: Vec<Entity> = Vec::new();
     let mut destroyed_bubbles: Vec<Entity> = Vec::new();
@@ -839,6 +869,7 @@ fn check_bubble_enemy_collision(
             if bubble_pos.distance(enemy_pos) < ENEMY_RADIUS {
                 enemy.health -= BUBBLE_DAMAGE;
                 destroyed_bubbles.push(bubble_entity);
+                enemy_hit.send(EnemyHit);
 
                 if enemy.health <= 0.0 {
                     destroyed_enemies.push(enemy_entity);
@@ -859,6 +890,11 @@ fn check_bubble_enemy_collision(
                 },
             );
         }
+    }
+
+    // Send event for each destroyed enemy
+    for _ in &destroyed_enemies {
+        enemy_destroyed.send(EnemyDestroyed);
     }
 
     // Despawn all at once after collision checks
@@ -886,6 +922,7 @@ fn update_bubble_lifetime(
 fn handle_ship_border(
     mut ship_query: Query<(&mut Ship, &Transform, &mut Velocity)>,
     window_query: Query<&Window>,
+    mut ship_bounced: EventWriter<ShipBounced>,
 ) {
     if let Ok((mut ship, transform, mut velocity)) = ship_query.get_single_mut() {
         let window = window_query.single();
@@ -904,6 +941,7 @@ fn handle_ship_border(
             if velocity.0.dot(to_center) < 0.0 {
                 ship.health -= impact_damage;
                 velocity.0 += to_center * bounce_force;
+                ship_bounced.send(ShipBounced);
             }
         }
     }
@@ -1033,6 +1071,7 @@ fn cleanup_get_ready_text(mut commands: Commands, query: Query<Entity, With<GetR
 fn handle_ship_enemy_collision(
     mut ship_query: Query<(&mut Ship, &Transform, &mut Velocity)>,
     enemy_query: Query<(&Transform, Option<&Growing>), With<Enemy>>,
+    mut ship_bounced: EventWriter<ShipBounced>,
 ) {
     if let Ok((mut ship, ship_transform, mut ship_vel)) = ship_query.get_single_mut() {
         let ship_pos = ship_transform.translation.truncate();
@@ -1053,6 +1092,7 @@ fn handle_ship_enemy_collision(
                 let bounce_dir = (ship_pos - enemy_pos).normalize();
                 ship_vel.0 += bounce_dir * bounce_force;
                 ship.health -= impact_damage;
+                ship_bounced.send(ShipBounced);
                 break; // Only handle one collision per frame
             }
         }
@@ -1172,6 +1212,33 @@ fn handle_bubble_sound(
     }
 }
 
+// Add system to handle enemy death sound
+fn handle_enemy_death_sound(
+    mut commands: Commands,
+    mut enemy_destroyed: EventReader<EnemyDestroyed>,
+    audio: Res<GameAudio>,
+) {
+    for _ in enemy_destroyed.read() {
+        commands.spawn((
+            AudioPlayer::new(audio.pop.clone()),
+            PlaybackSettings::DESPAWN,
+        ));
+    }
+}
+
+fn handle_ship_bounce_sound(
+    mut commands: Commands,
+    mut ship_bounced: EventReader<ShipBounced>,
+    audio: Res<GameAudio>,
+) {
+    for _ in ship_bounced.read() {
+        commands.spawn((
+            AudioPlayer::new(audio.bounce.clone()),
+            PlaybackSettings::DESPAWN,
+        ));
+    }
+}
+
 fn setup_game_round(
     mut commands: Commands,
     mut spawn_timer: ResMut<EnemySpawnTimer>,
@@ -1204,5 +1271,27 @@ fn handle_death_timer(
     timer.tick(time.delta());
     if timer.finished() {
         next_state.set(GameState::GameOver);
+    }
+}
+
+// Update enemy hit sound handler to use timer
+fn handle_enemy_hit_sound(
+    mut commands: Commands,
+    mut enemy_hit: EventReader<EnemyHit>,
+    mut drip_timer: ResMut<DripTimer>,
+    audio: Res<GameAudio>,
+    time: Res<Time>,
+) {
+    drip_timer.tick(time.delta());
+
+    if drip_timer.finished() {
+        for _ in enemy_hit.read() {
+            commands.spawn((
+                AudioPlayer::new(audio.drip.clone()),
+                PlaybackSettings::DESPAWN,
+            ));
+            drip_timer.reset();
+            break; // Only play one sound per timer tick
+        }
     }
 }
