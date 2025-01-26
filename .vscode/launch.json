@@ -9,15 +9,14 @@
       "request": "launch",
       "name": "Debug executable 'bubble'",
       "cargo": {
-        "args": [
-          "build",
-          "--bin=bubble",
-          "--package=bubble"
-        ],
+        "args": ["build", "--bin=bubble", "--package=bubble"],
         "filter": {
           "name": "bubble",
           "kind": "bin"
         }
+      },
+      "env": {
+        "CARGO_MANIFEST_DIR": "${workspaceFolder}"
       },
       "args": [],
       "cwd": "${workspaceFolder}"
@@ -27,16 +26,14 @@
       "request": "launch",
       "name": "Debug unit tests in executable 'bubble'",
       "cargo": {
-        "args": [
-          "test",
-          "--no-run",
-          "--bin=bubble",
-          "--package=bubble"
-        ],
+        "args": ["test", "--no-run", "--bin=bubble", "--package=bubble"],
         "filter": {
           "name": "bubble",
           "kind": "bin"
         }
+      },
+      "env": {
+        "CARGO_MANIFEST_DIR": "${workspaceFolder}"
       },
       "args": [],
       "cwd": "${workspaceFolder}"

@@ -1,5 +1,5 @@
 use bevy::app::App;
-use bevy::color::palettes::css::{ORANGE, RED};
+use bevy::color::palettes::css::{DARK_RED, ORANGE, RED, YELLOW};
 use bevy::prelude::*;
 use rand;
 use rand::Rng;
@@ -55,10 +55,6 @@ const ENEMY_BOUNCE_FORCE: f32 = 300.0;
 // Add velocity scaling constants
 const ENEMY_SPEED_SCALE_TIME: f32 = 60.0; // Time in seconds to reach max speed
 const ENEMY_MAX_SPEED_MULTIPLIER: f32 = 3.0; // Maximum speed multiplier
-
-// Add aiming constants
-const AIM_ROTATION_SPEED: f32 = 5.0; // Radians per second
-const KEYBOARD_SHOOT_INTERVAL: f32 = 0.1; // Seconds between shots when using keyboard
 
 // Add explosion type enum
 #[derive(Component, Clone, Copy)]
@@ -123,6 +119,61 @@ const MAX_BUBBLE_SUPPLY: f32 = 100.0;
 #[derive(Resource, Deref, DerefMut)]
 struct DeathTimer(Timer);
 
+// Add exit system
+fn handle_exit(keyboard: Res<ButtonInput<KeyCode>>, mut app_exit_events: EventWriter<AppExit>) {
+    if keyboard.just_pressed(KeyCode::Escape) {
+        app_exit_events.send(AppExit::default());
+    }
+}
+
+// Add marker component for game over UI
+#[derive(Component)]
+struct GameOverUI;
+
+// Add audio resource
+#[derive(Resource, Default)]
+struct GameAudio {
+    bubble_shoot: Handle<AudioSource>,
+}
+
+// Add shooting state component
+#[derive(Component)]
+struct ShootingState {
+    is_shooting: bool,
+    sound_timer: Timer,
+}
+
+impl Default for ShootingState {
+    fn default() -> Self {
+        Self {
+            is_shooting: false,
+            sound_timer: Timer::from_seconds(0.1, TimerMode::Repeating),
+        }
+    }
+}
+
+// Add bubble shot event
+#[derive(Event)]
+struct BubbleShot;
+
+// Add speed tracking component
+#[derive(Component)]
+struct EnemySpeed {
+    current_speed: f32,
+    max_speed: f32,
+    acceleration: f32,
+}
+
+impl Default for EnemySpeed {
+    fn default() -> Self {
+        Self {
+            current_speed: ENEMY_MIN_SPEED,
+            max_speed: ENEMY_MAX_SPEED,
+            acceleration: 50.0, // Speed increase per bounce
+        }
+    }
+}
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
@@ -130,6 +181,7 @@ fn main() {
         .insert_resource(StartingTimer(Timer::from_seconds(1.0, TimerMode::Once)))
         .insert_resource(EnemySpawnTimer::default())
         .insert_resource(DeathTimer(Timer::from_seconds(1.0, TimerMode::Once)))
+        .add_event::<BubbleShot>()
         .add_systems(Startup, setup)
         .insert_resource(ClearColor(Color::BLACK))
         .insert_resource(Mouse::default())
@@ -152,6 +204,8 @@ fn main() {
                 regenerate_bubble_supply,
                 update_enemy_growth,
                 handle_enemy_border,
+                update_shooting_state,
+                handle_bubble_sound,
             )
                 .run_if(in_state(GameState::Playing)),
         )
@@ -187,11 +241,18 @@ fn main() {
             Update,
             handle_death_timer.run_if(in_state(GameState::Dying)),
         )
+        .add_systems(Update, handle_exit)
+        .add_systems(OnExit(GameState::GameOver), cleanup_game_over_ui)
         .run();
 }
 
-fn setup(mut commands: Commands) {
+fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
     commands.spawn(Camera2d::default());
+
+    // Load and store audio assets
+    commands.insert_resource(GameAudio {
+        bubble_shoot: asset_server.load("sounds/bubble.wav"),
+    });
 }
 
 #[derive(Component, Default)]
@@ -215,6 +276,7 @@ struct Ship {
 struct Enemy {
     health: f32,
     variant: EnemyVariant,
+    color: Color,
 }
 
 #[derive(Component)]
@@ -238,7 +300,6 @@ fn random_pastel_color() -> Color {
 struct AimControl {
     mode: AimMode,
     angle: f32, // Angle in radians
-    shoot_timer: Timer,
 }
 
 impl Default for AimControl {
@@ -246,7 +307,6 @@ impl Default for AimControl {
         Self {
             mode: AimMode::Mouse,
             angle: 0.0, // Start aiming right
-            shoot_timer: Timer::from_seconds(KEYBOARD_SHOOT_INTERVAL, TimerMode::Repeating),
         }
     }
 }
@@ -297,22 +357,37 @@ fn update_aim_control(
     }
 }
 
-// Update bubble spawning to use aim_pos
-fn spawn_bubble(
-    mut commands: Commands,
-    mut ship_query: Query<(&Transform, &mut Ship, &mut Velocity, &AimControl)>,
+// Update shooting state
+fn update_shooting_state(
+    mut query: Query<(&AimControl, &mut ShootingState)>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mouse_button: Res<ButtonInput<MouseButton>>,
 ) {
-    if let Ok((ship_transform, mut ship, mut ship_vel, aim)) = ship_query.get_single_mut() {
-        let should_shoot = match aim.mode {
+    if let Ok((aim, mut shooting)) = query.get_single_mut() {
+        shooting.is_shooting = match aim.mode {
             AimMode::Mouse => mouse_button.pressed(MouseButton::Left),
             AimMode::Keyboard => {
                 keyboard.any_pressed([KeyCode::KeyW, KeyCode::KeyA, KeyCode::KeyS, KeyCode::KeyD])
             }
         };
+    }
+}
 
-        if should_shoot && ship.bubble_supply >= BUBBLE_COST {
+// Update bubble spawning to send event
+fn spawn_bubble(
+    mut commands: Commands,
+    mut ship_query: Query<(
+        &Transform,
+        &mut Ship,
+        &mut Velocity,
+        &ShootingState,
+        &AimControl,
+    )>,
+    mut bubble_shot: EventWriter<BubbleShot>,
+) {
+    if let Ok((ship_transform, mut ship, mut ship_vel, shooting, aim)) = ship_query.get_single_mut()
+    {
+        if shooting.is_shooting && ship.bubble_supply >= BUBBLE_COST {
             ship.bubble_supply -= BUBBLE_COST;
             let ship_pos = ship_transform.translation.truncate();
             let mut rng = rand::thread_rng();
@@ -342,6 +417,8 @@ fn spawn_bubble(
                 Velocity(rotated_direction * speed),
                 GameplayObject,
             ));
+
+            bubble_shot.send(BubbleShot);
         }
     }
 }
@@ -568,16 +645,22 @@ fn spawn_enemies(
         let x = rng.gen_range(-spawn_width / 2.0..spawn_width / 2.0);
         let y = rng.gen_range(-spawn_height / 2.0..spawn_height / 2.0);
 
+        let mut rng = rand::thread_rng();
+        let hue = rng.gen_range(0.0..360.0);
+        let enemy_color = Color::hsl(hue, 0.8, 0.7);
+
         commands.spawn((
             Enemy {
                 health: ENEMY_HEALTH,
                 variant: EnemyVariant::Floater,
+                color: enemy_color,
             },
             Transform::from_xyz(x, y, 0.0),
             Velocity(Vec2::new(
                 rng.gen_range(current_min_speed..current_max_speed),
                 rng.gen_range(current_min_speed..current_max_speed),
             )),
+            EnemySpeed::default(),
             Growing {
                 timer: Timer::from_seconds(ENEMY_GROWTH_TIME, TimerMode::Once),
             },
@@ -606,10 +689,11 @@ fn update_enemy_growth(
     }
 }
 
-// Update enemy drawing to handle growth
+// Update enemy drawing to add more visual detail
 fn draw_enemies(mut gizmos: Gizmos, query: Query<(&Transform, &Enemy, Option<&Growing>)>) {
     for (transform, enemy, growing) in &query {
         let pos = transform.translation.truncate();
+        let health_factor = enemy.health / ENEMY_HEALTH;
 
         let (scale, alpha) = if let Some(growing) = growing {
             let progress = growing.timer.fraction();
@@ -621,16 +705,64 @@ fn draw_enemies(mut gizmos: Gizmos, query: Query<(&Transform, &Enemy, Option<&Gr
 
         match enemy.variant {
             EnemyVariant::Floater => {
-                gizmos.circle_2d(pos, ENEMY_RADIUS * scale, RED.with_alpha(alpha));
+                let base_color = enemy.color;
+                let dark_color: Color = Hsla::from(base_color).with_lightness(0.3).into();
+
+                // Main body - darken with damage
+                let body_color: Color = Hsla::from(base_color)
+                    .with_lightness(0.7 * health_factor)
+                    .into();
+                gizmos.circle_2d(pos, ENEMY_RADIUS * scale, body_color.with_alpha(alpha));
+
+                // Inner ring
+                gizmos.circle_2d(
+                    pos,
+                    ENEMY_RADIUS * 0.7 * scale,
+                    dark_color.with_alpha(alpha),
+                );
+
+                // Core
+                gizmos.circle_2d(
+                    pos,
+                    ENEMY_RADIUS * 0.3 * scale,
+                    Color::WHITE.with_alpha(alpha),
+                );
+
+                // Spikes
+                let spikes = 8;
+                for i in 0..spikes {
+                    let angle = i as f32 * std::f32::consts::TAU / spikes as f32;
+                    let dir = Vec2::new(angle.cos(), angle.sin());
+                    let inner = pos + dir * ENEMY_RADIUS * 0.8 * scale;
+                    let outer = pos + dir * ENEMY_RADIUS * 1.2 * scale;
+                    gizmos.line_2d(inner, outer, dark_color.with_alpha(alpha * 0.8));
+                }
             }
             EnemyVariant::Seeker => {
-                // Draw orange triangle for seekers
+                // Triangular body
+                let forward = Vec2::Y * scale;
                 let points = [
-                    pos + Vec2::new(0.0, 20.0),
-                    pos + Vec2::new(-17.3, -10.0),
-                    pos + Vec2::new(17.3, -10.0),
+                    pos + forward * ENEMY_RADIUS * 1.2,
+                    pos + forward.rotate(Vec2::from_angle(2.3)) * ENEMY_RADIUS,
+                    pos + forward.rotate(Vec2::from_angle(-2.3)) * ENEMY_RADIUS,
                 ];
-                gizmos.linestrip_2d(points, ORANGE);
+
+                // Fill
+                gizmos.circle_2d(
+                    pos,
+                    ENEMY_RADIUS * 0.7 * scale,
+                    ORANGE.with_alpha(alpha * 0.5),
+                );
+
+                // Outline
+                for i in 0..points.len() {
+                    let start = points[i];
+                    let end = points[(i + 1) % points.len()];
+                    gizmos.line_2d(start, end, ORANGE.with_alpha(alpha));
+                }
+
+                // Core
+                gizmos.circle_2d(pos, ENEMY_RADIUS * 0.3 * scale, YELLOW.with_alpha(alpha));
             }
         }
     }
@@ -718,11 +850,13 @@ fn check_bubble_enemy_collision(
 
     // Spawn explosions for destroyed enemies
     for entity in &destroyed_enemies {
-        if let Ok((_, transform, ..)) = enemy_query.get(*entity) {
+        if let Ok((_, transform, enemy, ..)) = enemy_query.get(*entity) {
             spawn_explosion(
                 &mut commands,
                 transform.translation.truncate(),
-                ExplosionType::Enemy { color: RED },
+                ExplosionType::Enemy {
+                    color: enemy.color.into(),
+                },
             );
         }
     }
@@ -795,6 +929,7 @@ fn spawn_game_over_ui(mut commands: Commands) {
                 ..default()
             },
             BackgroundColor(Color::NONE),
+            GameOverUI, // Add marker component
         ))
         .with_children(|parent| {
             // Game Over Text
@@ -827,18 +962,20 @@ struct ReplayButton;
 fn handle_replay_button(
     mut next_state: ResMut<NextState<GameState>>,
     mut timer: ResMut<StartingTimer>,
-    mut interaction_query: Query<
-        (&Interaction, &Parent),
-        (Changed<Interaction>, With<ReplayButton>),
-    >,
-    mut commands: Commands,
+    mut interaction_query: Query<&Interaction, (Changed<Interaction>, With<ReplayButton>)>,
 ) {
-    for (interaction, parent) in &mut interaction_query {
+    for interaction in &mut interaction_query {
         if *interaction == Interaction::Pressed {
             next_state.set(GameState::Starting);
             timer.reset();
-            commands.entity(parent.get()).despawn_recursive();
         }
+    }
+}
+
+// Add cleanup system for game over UI
+fn cleanup_game_over_ui(mut commands: Commands, query: Query<Entity, With<GameOverUI>>) {
+    for entity in &query {
+        commands.entity(entity).despawn_recursive();
     }
 }
 
@@ -985,7 +1122,7 @@ fn regenerate_bubble_supply(mut query: Query<&mut Ship>, time: Res<Time>) {
 
 // Add new system for enemy border bouncing
 fn handle_enemy_border(
-    mut enemy_query: Query<(&Transform, &mut Velocity), With<Enemy>>,
+    mut enemy_query: Query<(&Transform, &mut Velocity, &mut EnemySpeed), With<Enemy>>,
     window_query: Query<&Window>,
     spawn_timer: Res<EnemySpawnTimer>,
 ) {
@@ -994,21 +1131,52 @@ fn handle_enemy_border(
     let half_width = window.width() / 2.0 - border_width;
     let half_height = window.height() / 2.0 - border_width;
 
-    // Get current speed multiplier
     let speed_multiplier = get_enemy_speed_multiplier(spawn_timer.elapsed_time);
-    let bounce_speed = ENEMY_BOUNCE_FORCE * speed_multiplier;
 
-    for (transform, mut velocity) in enemy_query.iter_mut() {
+    for (transform, mut velocity, mut speed) in enemy_query.iter_mut() {
         let pos = transform.translation;
 
         if pos.x.abs() > half_width || pos.y.abs() > half_height {
             let to_center = -pos.truncate().normalize();
-            velocity.0 = to_center * bounce_speed;
+
+            // Increase speed gradually
+            speed.current_speed =
+                (speed.current_speed + speed.acceleration).min(speed.max_speed * speed_multiplier);
+
+            velocity.0 = to_center * speed.current_speed;
         }
     }
 }
 
-fn setup_game_round(mut commands: Commands, mut spawn_timer: ResMut<EnemySpawnTimer>) {
+// Update sound system to use timer
+fn handle_bubble_sound(
+    mut commands: Commands,
+    mut bubble_shot: EventReader<BubbleShot>,
+    mut query: Query<&mut ShootingState>,
+    audio: Res<GameAudio>,
+    time: Res<Time>,
+) {
+    if let Ok(mut shooting) = query.get_single_mut() {
+        shooting.sound_timer.tick(time.delta());
+
+        if shooting.sound_timer.finished() {
+            for _ in bubble_shot.read() {
+                commands.spawn((
+                    AudioPlayer::new(audio.bubble_shoot.clone()),
+                    PlaybackSettings::DESPAWN,
+                ));
+                shooting.sound_timer.reset();
+                break; // Only play one sound per timer tick
+            }
+        }
+    }
+}
+
+fn setup_game_round(
+    mut commands: Commands,
+    mut spawn_timer: ResMut<EnemySpawnTimer>,
+    mut death_timer: ResMut<DeathTimer>,
+) {
     commands.spawn((
         Ship {
             health: SHIP_HEALTH,
@@ -1017,15 +1185,17 @@ fn setup_game_round(mut commands: Commands, mut spawn_timer: ResMut<EnemySpawnTi
         Transform::from_xyz(0.0, 0.0, 0.0),
         Velocity::default(),
         AimControl::default(),
+        ShootingState::default(),
         GameplayObject,
     ));
 
     // Reset enemy spawn timer
     spawn_timer.elapsed_time = 0.0;
     spawn_timer.timer.set_duration(Duration::from_secs_f32(3.0));
+
+    death_timer.reset();
 }
 
-// Add system to handle death timer
 fn handle_death_timer(
     mut timer: ResMut<DeathTimer>,
     time: Res<Time>,
