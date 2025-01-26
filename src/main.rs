@@ -3,38 +3,62 @@ use bevy::color::palettes::css::{ORANGE, RED};
 use bevy::prelude::*;
 use rand;
 use rand::Rng;
+use std::time::Duration;
 
 #[derive(States, Debug, Clone, Copy, Eq, PartialEq, Hash, Default)]
 enum GameState {
     #[default]
     Starting,
     Playing,
+    Dying,
     GameOver,
 }
 
 #[derive(Resource, Deref, DerefMut)]
 struct StartingTimer(Timer);
 
+// Add spawn timer resource
+#[derive(Resource)]
+struct EnemySpawnTimer {
+    timer: Timer,
+    elapsed_time: f32,
+    min_spawn_time: f32,
+}
+
+impl Default for EnemySpawnTimer {
+    fn default() -> Self {
+        Self {
+            timer: Timer::from_seconds(3.0, TimerMode::Repeating),
+            elapsed_time: 0.0,
+            min_spawn_time: 0.5, // Fastest spawn rate
+        }
+    }
+}
+
+// First, create a helper function for state conditions
+fn is_playing_or_dying(state: Res<State<GameState>>) -> bool {
+    matches!(state.get(), GameState::Playing | GameState::Dying)
+}
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
         .init_state::<GameState>()
         .insert_resource(StartingTimer(Timer::from_seconds(1.0, TimerMode::Once)))
+        .insert_resource(EnemySpawnTimer::default())
         .add_systems(Startup, setup)
         .insert_resource(ClearColor(Color::BLACK))
         .insert_resource(Mouse::default())
         .add_systems(
             Update,
             (
+                // Update systems - only run during Playing
                 calculate_mouse_position,
                 spawn_bubble,
                 move_bubbles,
-                draw_bubbles,
                 despawn_bubbles,
                 move_ship,
-                draw_ship,
                 spawn_enemies,
-                draw_enemies,
                 check_bubble_enemy_collision,
                 update_bubble_lifetime,
                 handle_ship_border,
@@ -43,8 +67,18 @@ fn main() {
             )
                 .run_if(in_state(GameState::Playing)),
         )
+        .add_systems(
+            Update,
+            (
+                // Draw systems - run during both Playing and Dying
+                draw_ship,
+                draw_bubbles,
+                draw_enemies,
+            )
+                .run_if(is_playing_or_dying),
+        )
         .add_systems(OnEnter(GameState::GameOver), spawn_game_over_ui)
-        .add_systems(OnExit(GameState::Playing), cleanup_gameplay)
+        .add_systems(OnExit(GameState::Dying), cleanup_gameplay)
         .add_systems(
             OnEnter(GameState::Starting),
             (setup_game_round, spawn_get_ready_text),
@@ -57,6 +91,11 @@ fn main() {
         .add_systems(
             Update,
             handle_replay_button.run_if(in_state(GameState::GameOver)),
+        )
+        .add_systems(OnEnter(GameState::Dying), spawn_ship_explosion)
+        .add_systems(
+            Update,
+            (update_explosion, draw_explosion).run_if(in_state(GameState::Dying)),
         )
         .run();
 }
@@ -323,12 +362,28 @@ fn draw_ship(
     }
 }
 
-fn spawn_enemies(mut commands: Commands, time: Res<Time>, window_query: Query<&Window>) {
-    let window = window_query.single();
-    let mut rng = rand::thread_rng();
+// Update spawn_enemies system
+fn spawn_enemies(
+    mut commands: Commands,
+    time: Res<Time>,
+    window_query: Query<&Window>,
+    mut spawn_timer: ResMut<EnemySpawnTimer>,
+) {
+    spawn_timer.elapsed_time += time.delta_secs();
 
-    // Spawn every few seconds
-    if time.elapsed_secs() % 3.0 < time.delta_secs() {
+    // Gradually decrease spawn time (3.0 -> 0.5 seconds over 60 seconds)
+    let current_spawn_time =
+        (3.0 - (spawn_timer.elapsed_time / 60.0) * 2.5).max(spawn_timer.min_spawn_time);
+    spawn_timer
+        .timer
+        .set_duration(Duration::from_secs_f32(current_spawn_time));
+
+    spawn_timer.timer.tick(time.delta());
+
+    if spawn_timer.timer.just_finished() {
+        let window = window_query.single();
+        let mut rng = rand::thread_rng();
+
         let x = rng.gen_range(-window.width() / 2.0..window.width() / 2.0);
         let y = rng.gen_range(-window.height() / 2.0..window.height() / 2.0);
 
@@ -453,7 +508,7 @@ fn handle_ship_border(
 fn check_game_over(ship_query: Query<&Ship>, mut next_state: ResMut<NextState<GameState>>) {
     if let Ok(ship) = ship_query.get_single() {
         if ship.health <= 0.0 {
-            next_state.set(GameState::GameOver);
+            next_state.set(GameState::Dying);
         }
     }
 }
@@ -528,14 +583,18 @@ fn cleanup_gameplay(mut commands: Commands, query: Query<Entity, With<GameplayOb
     }
 }
 
-// Add this new system
-fn setup_game_round(mut commands: Commands) {
+// Reset timer in setup_game_round
+fn setup_game_round(mut commands: Commands, mut spawn_timer: ResMut<EnemySpawnTimer>) {
     commands.spawn((
         Ship { health: 100.0 },
         Transform::from_xyz(0.0, 0.0, 0.0),
         Velocity::default(),
         GameplayObject,
     ));
+
+    // Reset enemy spawn timer
+    spawn_timer.elapsed_time = 0.0;
+    spawn_timer.timer.set_duration(Duration::from_secs_f32(3.0));
 }
 
 fn handle_starting_state(
@@ -599,5 +658,73 @@ fn handle_ship_enemy_collision(
                 break; // Only handle one collision per frame
             }
         }
+    }
+}
+
+// Add explosion particle component
+#[derive(Component)]
+struct ExplosionParticle {
+    lifetime: Timer,
+    velocity: Vec2,
+    size: f32,
+}
+
+// Add system to spawn explosion
+fn spawn_ship_explosion(ship_query: Query<&Transform, With<Ship>>, mut commands: Commands) {
+    if let Ok(ship_transform) = ship_query.get_single() {
+        let pos = ship_transform.translation.truncate();
+        let mut rng = rand::thread_rng();
+
+        // Spawn multiple particles
+        for _ in 0..30 {
+            let angle = rng.gen_range(0.0..std::f32::consts::TAU);
+            let speed = rng.gen_range(100.0..300.0);
+            let velocity = Vec2::new(angle.cos(), angle.sin()) * speed;
+
+            commands.spawn((
+                ExplosionParticle {
+                    lifetime: Timer::from_seconds(1.0, TimerMode::Once),
+                    velocity,
+                    size: rng.gen_range(2.0..8.0),
+                },
+                Transform::from_xyz(pos.x, pos.y, 0.0),
+                GameplayObject,
+            ));
+        }
+    }
+}
+
+// Add system to update explosion particles
+fn update_explosion(
+    mut commands: Commands,
+    mut particles: Query<(Entity, &mut Transform, &mut ExplosionParticle)>,
+    time: Res<Time>,
+    mut next_state: ResMut<NextState<GameState>>,
+) {
+    let mut all_particles_done = true;
+
+    for (entity, mut transform, mut particle) in &mut particles {
+        particle.lifetime.tick(time.delta());
+
+        if particle.lifetime.finished() {
+            commands.entity(entity).despawn();
+        } else {
+            all_particles_done = false;
+            transform.translation += particle.velocity.extend(0.0) * time.delta_secs();
+            particle.velocity *= 0.98; // Add some drag
+        }
+    }
+
+    if all_particles_done {
+        next_state.set(GameState::GameOver);
+    }
+}
+
+// Add system to draw explosion particles
+fn draw_explosion(mut gizmos: Gizmos, query: Query<(&Transform, &ExplosionParticle)>) {
+    for (transform, particle) in &query {
+        let pos = transform.translation.truncate();
+        let alpha = particle.lifetime.fraction_remaining();
+        gizmos.circle_2d(pos, particle.size, Color::srgba(1.0, 0.5, 0.0, alpha));
     }
 }
