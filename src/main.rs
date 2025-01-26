@@ -60,6 +60,21 @@ const ENEMY_MAX_SPEED_MULTIPLIER: f32 = 3.0; // Maximum speed multiplier
 const AIM_ROTATION_SPEED: f32 = 5.0; // Radians per second
 const KEYBOARD_SHOOT_INTERVAL: f32 = 0.1; // Seconds between shots when using keyboard
 
+// Add explosion type enum
+#[derive(Component, Clone, Copy)]
+enum ExplosionType {
+    Ship,
+    Enemy { color: Srgba },
+}
+
+// Update enemy explosion constants
+const ENEMY_EXPLOSION_PARTICLES: u32 = 15;
+const ENEMY_EXPLOSION_MIN_SPEED: f32 = 50.0;
+const ENEMY_EXPLOSION_MAX_SPEED: f32 = 150.0;
+const ENEMY_EXPLOSION_MIN_SIZE: f32 = 1.0;
+const ENEMY_EXPLOSION_MAX_SIZE: f32 = 4.0;
+const ENEMY_EXPLOSION_LIFETIME: f32 = 0.5;
+
 #[derive(PartialEq)]
 enum AimMode {
     Mouse,
@@ -104,12 +119,17 @@ fn is_playing_or_dying(state: Res<State<GameState>>) -> bool {
 // Add bubble supply config
 const MAX_BUBBLE_SUPPLY: f32 = 100.0;
 
+// Add death timer resource
+#[derive(Resource, Deref, DerefMut)]
+struct DeathTimer(Timer);
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
         .init_state::<GameState>()
         .insert_resource(StartingTimer(Timer::from_seconds(1.0, TimerMode::Once)))
         .insert_resource(EnemySpawnTimer::default())
+        .insert_resource(DeathTimer(Timer::from_seconds(1.0, TimerMode::Once)))
         .add_systems(Startup, setup)
         .insert_resource(ClearColor(Color::BLACK))
         .insert_resource(Mouse::default())
@@ -142,6 +162,8 @@ fn main() {
                 draw_ship,
                 draw_bubbles,
                 draw_enemies,
+                update_explosion,
+                draw_explosion,
             )
                 .run_if(is_playing_or_dying),
         )
@@ -163,7 +185,7 @@ fn main() {
         .add_systems(OnEnter(GameState::Dying), spawn_ship_explosion)
         .add_systems(
             Update,
-            (update_explosion, draw_explosion).run_if(in_state(GameState::Dying)),
+            handle_death_timer.run_if(in_state(GameState::Dying)),
         )
         .run();
 }
@@ -614,6 +636,47 @@ fn draw_enemies(mut gizmos: Gizmos, query: Query<(&Transform, &Enemy, Option<&Gr
     }
 }
 
+// Add function to spawn explosions
+fn spawn_explosion(commands: &mut Commands, pos: Vec2, explosion_type: ExplosionType) {
+    let (particles, min_speed, max_speed, min_size, max_size, lifetime) = match &explosion_type {
+        ExplosionType::Ship => (
+            EXPLOSION_PARTICLES,
+            EXPLOSION_MIN_SPEED,
+            EXPLOSION_MAX_SPEED,
+            EXPLOSION_MIN_SIZE,
+            EXPLOSION_MAX_SIZE,
+            EXPLOSION_LIFETIME,
+        ),
+        ExplosionType::Enemy { .. } => (
+            ENEMY_EXPLOSION_PARTICLES,
+            ENEMY_EXPLOSION_MIN_SPEED,
+            ENEMY_EXPLOSION_MAX_SPEED,
+            ENEMY_EXPLOSION_MIN_SIZE,
+            ENEMY_EXPLOSION_MAX_SIZE,
+            ENEMY_EXPLOSION_LIFETIME,
+        ),
+    };
+
+    let mut rng = rand::thread_rng();
+    for _ in 0..particles {
+        let angle = rng.gen_range(0.0..std::f32::consts::TAU);
+        let speed = rng.gen_range(min_speed..max_speed);
+        let velocity = Vec2::new(angle.cos(), angle.sin()) * speed;
+
+        commands.spawn((
+            ExplosionParticle {
+                lifetime: Timer::from_seconds(lifetime, TimerMode::Once),
+                velocity,
+                size: rng.gen_range(min_size..max_size),
+            },
+            Transform::from_xyz(pos.x, pos.y, 0.0),
+            explosion_type.clone(),
+            GameplayObject,
+        ));
+    }
+}
+
+// Update check_bubble_enemy_collision to spawn explosions
 fn check_bubble_enemy_collision(
     mut commands: Commands,
     bubble_query: Query<(Entity, &Transform), With<Bubble>>,
@@ -650,6 +713,17 @@ fn check_bubble_enemy_collision(
                 }
                 break; // Bubble can only hit one enemy
             }
+        }
+    }
+
+    // Spawn explosions for destroyed enemies
+    for entity in &destroyed_enemies {
+        if let Ok((_, transform, ..)) = enemy_query.get(*entity) {
+            spawn_explosion(
+                &mut commands,
+                transform.translation.truncate(),
+                ExplosionType::Enemy { color: RED },
+            );
         }
     }
 
@@ -856,63 +930,48 @@ struct ExplosionParticle {
     size: f32,
 }
 
-// Add system to spawn explosion
+// Update ship explosion spawn to use the new system
 fn spawn_ship_explosion(ship_query: Query<&Transform, With<Ship>>, mut commands: Commands) {
-    if let Ok(ship_transform) = ship_query.get_single() {
-        let pos = ship_transform.translation.truncate();
-        let mut rng = rand::thread_rng();
-
-        // Spawn multiple particles
-        for _ in 0..EXPLOSION_PARTICLES {
-            let angle = rng.gen_range(0.0..std::f32::consts::TAU);
-            let speed = rng.gen_range(EXPLOSION_MIN_SPEED..EXPLOSION_MAX_SPEED);
-            let velocity = Vec2::new(angle.cos(), angle.sin()) * speed;
-
-            commands.spawn((
-                ExplosionParticle {
-                    lifetime: Timer::from_seconds(EXPLOSION_LIFETIME, TimerMode::Once),
-                    velocity,
-                    size: rng.gen_range(EXPLOSION_MIN_SIZE..EXPLOSION_MAX_SIZE),
-                },
-                Transform::from_xyz(pos.x, pos.y, 0.0),
-                GameplayObject,
-            ));
-        }
+    if let Ok(transform) = ship_query.get_single() {
+        spawn_explosion(
+            &mut commands,
+            transform.translation.truncate(),
+            ExplosionType::Ship,
+        );
     }
 }
 
-// Add system to update explosion particles
+// Update system to update explosion particles
 fn update_explosion(
     mut commands: Commands,
     mut particles: Query<(Entity, &mut Transform, &mut ExplosionParticle)>,
     time: Res<Time>,
-    mut next_state: ResMut<NextState<GameState>>,
 ) {
-    let mut all_particles_done = true;
-
     for (entity, mut transform, mut particle) in &mut particles {
         particle.lifetime.tick(time.delta());
 
         if particle.lifetime.finished() {
             commands.entity(entity).despawn();
         } else {
-            all_particles_done = false;
             transform.translation += particle.velocity.extend(0.0) * time.delta_secs();
             particle.velocity *= EXPLOSION_DRAG;
         }
     }
-
-    if all_particles_done {
-        next_state.set(GameState::GameOver);
-    }
 }
 
-// Add system to draw explosion particles
-fn draw_explosion(mut gizmos: Gizmos, query: Query<(&Transform, &ExplosionParticle)>) {
-    for (transform, particle) in &query {
+// Update draw_explosion to handle different explosion types
+fn draw_explosion(
+    mut gizmos: Gizmos,
+    query: Query<(&Transform, &ExplosionParticle, &ExplosionType)>,
+) {
+    for (transform, particle, explosion_type) in &query {
         let pos = transform.translation.truncate();
         let alpha = particle.lifetime.fraction_remaining();
-        gizmos.circle_2d(pos, particle.size, Color::srgba(1.0, 0.5, 0.0, alpha));
+        let color = match explosion_type {
+            ExplosionType::Ship => Color::srgba(1.0, 0.5, 0.0, alpha),
+            ExplosionType::Enemy { color } => Color::from(*color).with_alpha(alpha),
+        };
+        gizmos.circle_2d(pos, particle.size, color);
     }
 }
 
@@ -964,4 +1023,16 @@ fn setup_game_round(mut commands: Commands, mut spawn_timer: ResMut<EnemySpawnTi
     // Reset enemy spawn timer
     spawn_timer.elapsed_time = 0.0;
     spawn_timer.timer.set_duration(Duration::from_secs_f32(3.0));
+}
+
+// Add system to handle death timer
+fn handle_death_timer(
+    mut timer: ResMut<DeathTimer>,
+    time: Res<Time>,
+    mut next_state: ResMut<NextState<GameState>>,
+) {
+    timer.tick(time.delta());
+    if timer.finished() {
+        next_state.set(GameState::GameOver);
+    }
 }
