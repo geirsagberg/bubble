@@ -5,6 +5,67 @@ use rand;
 use rand::Rng;
 use std::time::Duration;
 
+// Game balance constants
+const SHIP_HEALTH: f32 = 100.0;
+const SHIP_RADIUS: f32 = 15.0;
+const SHIP_ACCELERATION: f32 = 1000.0;
+const SHIP_MAX_SPEED: f32 = 300.0;
+const SHIP_FRICTION: f32 = 0.98;
+const SHIP_RECOIL_FORCE: f32 = 5.0;
+
+const BUBBLE_MAX_SUPPLY: f32 = 100.0;
+const BUBBLE_COST: f32 = 1.0;
+const BUBBLE_REGEN_RATE: f32 = 50.0; // Per second
+const BUBBLE_MIN_SIZE: f32 = 5.0;
+const BUBBLE_MAX_SIZE: f32 = 15.0;
+const BUBBLE_MIN_SPEED: f32 = 100.0;
+const BUBBLE_MAX_SPEED: f32 = 200.0;
+const BUBBLE_MIN_LIFETIME: f32 = 1.0;
+const BUBBLE_MAX_LIFETIME: f32 = 2.0;
+const BUBBLE_SPREAD_ANGLE: f32 = 0.3;
+const BUBBLE_DAMAGE: f32 = 10.0;
+
+const ENEMY_HEALTH: f32 = 100.0;
+const ENEMY_RADIUS: f32 = 20.0;
+const ENEMY_MIN_SPEED: f32 = -50.0;
+const ENEMY_MAX_SPEED: f32 = 50.0;
+const ENEMY_COLLISION_DAMAGE: f32 = 20.0;
+const ENEMY_COLLISION_FORCE: f32 = 400.0;
+
+const BORDER_WIDTH: f32 = 50.0;
+const BORDER_DAMAGE: f32 = 10.0;
+const BORDER_BOUNCE_FORCE: f32 = 500.0;
+
+const EXPLOSION_PARTICLES: u32 = 30;
+const EXPLOSION_MIN_SPEED: f32 = 100.0;
+const EXPLOSION_MAX_SPEED: f32 = 300.0;
+const EXPLOSION_MIN_SIZE: f32 = 2.0;
+const EXPLOSION_MAX_SIZE: f32 = 8.0;
+const EXPLOSION_LIFETIME: f32 = 1.0;
+const EXPLOSION_DRAG: f32 = 0.98;
+
+// Add growth constants
+const ENEMY_GROWTH_TIME: f32 = 1.0;
+const ENEMY_MIN_SCALE: f32 = 0.1;
+
+// Add at the top with other constants
+const ENEMY_SPAWN_MARGIN: f32 = 100.0; // Keep enemies away from borders on spawn
+const ENEMY_BOUNCE_FORCE: f32 = 300.0;
+
+// Add velocity scaling constants
+const ENEMY_SPEED_SCALE_TIME: f32 = 60.0; // Time in seconds to reach max speed
+const ENEMY_MAX_SPEED_MULTIPLIER: f32 = 3.0; // Maximum speed multiplier
+
+// Add aiming constants
+const AIM_ROTATION_SPEED: f32 = 5.0; // Radians per second
+const KEYBOARD_SHOOT_INTERVAL: f32 = 0.1; // Seconds between shots when using keyboard
+
+#[derive(PartialEq)]
+enum AimMode {
+    Mouse,
+    Keyboard,
+}
+
 #[derive(States, Debug, Clone, Copy, Eq, PartialEq, Hash, Default)]
 enum GameState {
     #[default]
@@ -40,6 +101,9 @@ fn is_playing_or_dying(state: Res<State<GameState>>) -> bool {
     matches!(state.get(), GameState::Playing | GameState::Dying)
 }
 
+// Add bubble supply config
+const MAX_BUBBLE_SUPPLY: f32 = 100.0;
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
@@ -58,12 +122,16 @@ fn main() {
                 move_bubbles,
                 despawn_bubbles,
                 move_ship,
+                update_aim_control,
                 spawn_enemies,
                 check_bubble_enemy_collision,
                 update_bubble_lifetime,
                 handle_ship_border,
                 check_game_over,
                 handle_ship_enemy_collision,
+                regenerate_bubble_supply,
+                update_enemy_growth,
+                handle_enemy_border,
             )
                 .run_if(in_state(GameState::Playing)),
         )
@@ -118,6 +186,7 @@ struct Bubble {
 #[require(Transform, Velocity)]
 struct Ship {
     health: f32,
+    bubble_supply: f32, // 0.0 to 100.0
 }
 
 #[derive(Component)]
@@ -142,41 +211,113 @@ fn random_pastel_color() -> Color {
     )
 }
 
-fn spawn_bubble(
-    mut commands: Commands,
-    ship_query: Query<&Transform, With<Ship>>,
-    mut ship_velocity: Query<&mut Velocity, With<Ship>>,
+// Update AimControl component
+#[derive(Component)]
+struct AimControl {
+    mode: AimMode,
+    angle: f32, // Angle in radians
+    shoot_timer: Timer,
+}
+
+impl Default for AimControl {
+    fn default() -> Self {
+        Self {
+            mode: AimMode::Mouse,
+            angle: 0.0, // Start aiming right
+            shoot_timer: Timer::from_seconds(KEYBOARD_SHOOT_INTERVAL, TimerMode::Repeating),
+        }
+    }
+}
+
+// Update aim control system
+fn update_aim_control(
+    mut query: Query<(&Transform, &mut AimControl)>,
+    keyboard: Res<ButtonInput<KeyCode>>,
     mouse: Res<Mouse>,
     mouse_button: Res<ButtonInput<MouseButton>>,
 ) {
-    if let (Ok(ship_transform), Ok(mut ship_vel)) =
-        (ship_query.get_single(), ship_velocity.get_single_mut())
-    {
+    if let Ok((transform, mut aim)) = query.get_single_mut() {
+        let pos = transform.translation.truncate();
+
+        // Check for mode switches
         if mouse_button.pressed(MouseButton::Left) {
+            aim.mode = AimMode::Mouse;
+        } else if keyboard.any_pressed([KeyCode::KeyW, KeyCode::KeyA, KeyCode::KeyS, KeyCode::KeyD])
+        {
+            aim.mode = AimMode::Keyboard;
+        }
+
+        match aim.mode {
+            AimMode::Mouse => {
+                let to_mouse = mouse.position - pos;
+                aim.angle = Vec2::new(to_mouse.x, -to_mouse.y).angle_to(Vec2::X);
+            }
+            AimMode::Keyboard => {
+                let mut direction = Vec2::ZERO;
+                if keyboard.pressed(KeyCode::KeyW) {
+                    direction.y += 1.0;
+                }
+                if keyboard.pressed(KeyCode::KeyS) {
+                    direction.y -= 1.0;
+                }
+                if keyboard.pressed(KeyCode::KeyA) {
+                    direction.x += 1.0;
+                }
+                if keyboard.pressed(KeyCode::KeyD) {
+                    direction.x -= 1.0;
+                }
+
+                if direction != Vec2::ZERO {
+                    aim.angle = direction.normalize().angle_to(Vec2::X);
+                }
+            }
+        }
+    }
+}
+
+// Update bubble spawning to use aim_pos
+fn spawn_bubble(
+    mut commands: Commands,
+    mut ship_query: Query<(&Transform, &mut Ship, &mut Velocity, &AimControl)>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mouse_button: Res<ButtonInput<MouseButton>>,
+) {
+    if let Ok((ship_transform, mut ship, mut ship_vel, aim)) = ship_query.get_single_mut() {
+        let should_shoot = match aim.mode {
+            AimMode::Mouse => mouse_button.pressed(MouseButton::Left),
+            AimMode::Keyboard => {
+                keyboard.any_pressed([KeyCode::KeyW, KeyCode::KeyA, KeyCode::KeyS, KeyCode::KeyD])
+            }
+        };
+
+        if should_shoot && ship.bubble_supply >= BUBBLE_COST {
+            ship.bubble_supply -= BUBBLE_COST;
             let ship_pos = ship_transform.translation.truncate();
             let mut rng = rand::thread_rng();
 
-            // Calculate direction to mouse with some randomness
-            let to_mouse = (mouse.position - ship_pos).normalize();
-            let random_angle = rng.gen_range(-0.3..0.3);
-            let direction = Vec2::new(
-                to_mouse.x * (random_angle as f32).cos() - to_mouse.y * (random_angle as f32).sin(),
-                to_mouse.x * (random_angle as f32).sin() + to_mouse.y * (random_angle as f32).cos(),
+            // Use current aim angle for direction
+            let direction = Vec2::from_angle(aim.angle);
+            let random_angle = rng.gen_range(-BUBBLE_SPREAD_ANGLE..BUBBLE_SPREAD_ANGLE);
+            let rotated_direction = Vec2::new(
+                direction.x * random_angle.cos() - direction.y * random_angle.sin(),
+                direction.x * random_angle.sin() + direction.y * random_angle.cos(),
             );
-            let speed = rng.gen_range(100.0..200.0);
+            let speed = rng.gen_range(BUBBLE_MIN_SPEED..BUBBLE_MAX_SPEED);
 
             // Apply recoil to ship
-            let recoil_force = 5.0;
-            ship_vel.0 -= direction * recoil_force;
+            ship_vel.0 -= rotated_direction * SHIP_RECOIL_FORCE;
 
             commands.spawn((
                 Bubble {
                     color: random_pastel_color(),
-                    size: rng.gen_range(5.0..15.0),
-                    lifetime: Timer::from_seconds(rng.gen_range(1.0..2.0), TimerMode::Once),
+                    size: rng.gen_range(BUBBLE_MIN_SIZE..BUBBLE_MAX_SIZE),
+                    lifetime: Timer::from_seconds(
+                        rng.gen_range(BUBBLE_MIN_LIFETIME..BUBBLE_MAX_LIFETIME),
+                        TimerMode::Once,
+                    ),
                 },
                 Transform::from_xyz(ship_pos.x, ship_pos.y, 0.0),
-                Velocity(direction * speed),
+                Velocity(rotated_direction * speed),
                 GameplayObject,
             ));
         }
@@ -257,7 +398,6 @@ fn despawn_bubbles(
 
 fn move_ship(
     mut query: Query<(&mut Transform, &mut Velocity), With<Ship>>,
-    keyboard: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
     window_query: Query<&Window>,
 ) {
@@ -267,27 +407,12 @@ fn move_ship(
         let half_height = window.height() / 2.0;
 
         let mut acceleration = Vec2::ZERO;
-        let acceleration_rate = 1000.0;
-        let max_speed = 300.0;
-        let friction = 0.98;
-
-        if keyboard.pressed(KeyCode::KeyW) {
-            acceleration.y += 1.0;
-        }
-        if keyboard.pressed(KeyCode::KeyS) {
-            acceleration.y -= 1.0;
-        }
-        if keyboard.pressed(KeyCode::KeyA) {
-            acceleration.x -= 1.0;
-        }
-        if keyboard.pressed(KeyCode::KeyD) {
-            acceleration.x += 1.0;
-        }
+        let friction = SHIP_FRICTION;
 
         let dt = time.delta_secs();
 
         if acceleration != Vec2::ZERO {
-            acceleration = acceleration.normalize() * acceleration_rate * dt;
+            acceleration = acceleration.normalize() * SHIP_ACCELERATION * dt;
             velocity.0 += acceleration;
         }
 
@@ -295,8 +420,8 @@ fn move_ship(
         velocity.0 *= friction;
 
         // Clamp maximum speed
-        if velocity.0.length() > max_speed {
-            velocity.0 = velocity.0.normalize() * max_speed;
+        if velocity.0.length() > SHIP_MAX_SPEED {
+            velocity.0 = velocity.0.normalize() * SHIP_MAX_SPEED;
         }
 
         transform.translation += velocity.0.extend(0.0) * dt;
@@ -318,51 +443,76 @@ fn move_ship(
 
 fn draw_ship(
     mut gizmos: Gizmos,
-    query: Query<(&Transform, &Ship)>,
-    mouse: Res<Mouse>,
+    query: Query<(&Transform, &Ship, &AimControl)>,
     window_query: Query<&Window>,
 ) {
     let window = window_query.single();
-    let border_width = 50.0;
+    let border_width = BORDER_WIDTH;
 
     // Draw danger border
     gizmos.rect_2d(
-        Vec2::ZERO, // center position
+        Vec2::ZERO,
         Vec2::new(
             window.width() - border_width,
             window.height() - border_width,
-        ), // size
-        Color::srgba(1.0, 0.0, 0.0, 0.2), // color
+        ),
+        Color::srgba(1.0, 0.0, 0.0, 0.2),
     );
 
-    if let Ok((transform, ship)) = query.get_single() {
+    if let Ok((transform, ship, aim)) = query.get_single() {
         let pos = transform.translation.truncate();
 
-        // Calculate ship color based on health (100 -> white, 0 -> dark red)
+        // Calculate ship colors based on health
         let health_factor = (ship.health / 100.0).clamp(0.0, 1.0);
-        let ship_color = Color::srgb(
-            1.0,           // Red stays at 1.0
-            health_factor, // Green fades with health
-            health_factor, // Blue fades with health
-        );
+        let ship_color = Color::srgb(1.0, health_factor, health_factor);
 
-        // Draw ship circle with health color
-        gizmos.circle_2d(pos, 15.0, ship_color);
+        // Draw outer ship circle
+        gizmos.circle_2d(pos, SHIP_RADIUS, ship_color);
 
-        // Draw aim line with same color
-        let to_mouse = (mouse.position - pos).normalize();
+        // Draw inner bubble supply circle
+        let bubble_radius = 10.0 * (ship.bubble_supply / MAX_BUBBLE_SUPPLY);
+        let bubble_color = Color::srgb(0.3, 0.8, 1.0);
+        gizmos.circle_2d(pos, bubble_radius, bubble_color);
+
+        // Draw aim line using current aim angle
+        let aim_direction = Vec2::from_angle(aim.angle);
         let rect_length = 20.0;
-        let rect_center = pos + to_mouse * 15.0;
+        let rect_center = pos + aim_direction * 15.0;
 
-        gizmos.line_2d(
-            rect_center - to_mouse * rect_length / 2.0,
-            rect_center + to_mouse * rect_length / 2.0,
-            ship_color,
-        );
+        // Draw aim line with different styles based on mode
+        match aim.mode {
+            AimMode::Mouse => {
+                gizmos.line_2d(
+                    rect_center - aim_direction * rect_length / 2.0,
+                    rect_center + aim_direction * rect_length / 2.0,
+                    ship_color,
+                );
+            }
+            AimMode::Keyboard => {
+                // Draw a dashed/animated line for keyboard mode
+                let segments = 5;
+                let segment_length = rect_length / segments as f32;
+                let time = (aim.angle / std::f32::consts::PI * 2.0).sin() * 0.5 + 0.5;
+
+                for i in 0..segments {
+                    let start = rect_center - aim_direction * rect_length / 2.0
+                        + aim_direction * i as f32 * segment_length;
+                    let end = start + aim_direction * segment_length * 0.7;
+                    let alpha = (i as f32 / segments as f32 + time) % 1.0;
+                    gizmos.line_2d(start, end, ship_color.with_alpha(alpha));
+                }
+            }
+        }
     }
 }
 
-// Update spawn_enemies system
+// Add helper function to calculate current speed multiplier
+fn get_enemy_speed_multiplier(elapsed_time: f32) -> f32 {
+    1.0 + (elapsed_time / ENEMY_SPEED_SCALE_TIME * (ENEMY_MAX_SPEED_MULTIPLIER - 1.0))
+        .min(ENEMY_MAX_SPEED_MULTIPLIER - 1.0)
+}
+
+// Update spawn_enemies to use speed scaling
 fn spawn_enemies(
     mut commands: Commands,
     time: Res<Time>,
@@ -378,37 +528,78 @@ fn spawn_enemies(
         .timer
         .set_duration(Duration::from_secs_f32(current_spawn_time));
 
+    // Get current speed multiplier
+    let speed_multiplier = get_enemy_speed_multiplier(spawn_timer.elapsed_time);
+    let current_max_speed = ENEMY_MAX_SPEED * speed_multiplier;
+    let current_min_speed = ENEMY_MIN_SPEED * speed_multiplier;
+
     spawn_timer.timer.tick(time.delta());
 
     if spawn_timer.timer.just_finished() {
         let window = window_query.single();
         let mut rng = rand::thread_rng();
 
-        let x = rng.gen_range(-window.width() / 2.0..window.width() / 2.0);
-        let y = rng.gen_range(-window.height() / 2.0..window.height() / 2.0);
+        // Calculate spawn area within borders
+        let spawn_width = window.width() - 2.0 * (BORDER_WIDTH + ENEMY_SPAWN_MARGIN);
+        let spawn_height = window.height() - 2.0 * (BORDER_WIDTH + ENEMY_SPAWN_MARGIN);
+
+        let x = rng.gen_range(-spawn_width / 2.0..spawn_width / 2.0);
+        let y = rng.gen_range(-spawn_height / 2.0..spawn_height / 2.0);
 
         commands.spawn((
             Enemy {
-                health: 100.0,
+                health: ENEMY_HEALTH,
                 variant: EnemyVariant::Floater,
             },
             Transform::from_xyz(x, y, 0.0),
             Velocity(Vec2::new(
-                rng.gen_range(-50.0..50.0),
-                rng.gen_range(-50.0..50.0),
+                rng.gen_range(current_min_speed..current_max_speed),
+                rng.gen_range(current_min_speed..current_max_speed),
             )),
+            Growing {
+                timer: Timer::from_seconds(ENEMY_GROWTH_TIME, TimerMode::Once),
+            },
             GameplayObject,
         ));
     }
 }
 
-fn draw_enemies(mut gizmos: Gizmos, query: Query<(&Transform, &Enemy)>) {
-    for (transform, enemy) in &query {
+// Add growth component
+#[derive(Component)]
+struct Growing {
+    timer: Timer,
+}
+
+// Update enemy spawn to include growth
+fn update_enemy_growth(
+    mut commands: Commands,
+    mut query: Query<(Entity, &mut Growing)>,
+    time: Res<Time>,
+) {
+    for (entity, mut growing) in &mut query {
+        growing.timer.tick(time.delta());
+        if growing.timer.finished() {
+            commands.entity(entity).remove::<Growing>();
+        }
+    }
+}
+
+// Update enemy drawing to handle growth
+fn draw_enemies(mut gizmos: Gizmos, query: Query<(&Transform, &Enemy, Option<&Growing>)>) {
+    for (transform, enemy, growing) in &query {
         let pos = transform.translation.truncate();
+
+        let (scale, alpha) = if let Some(growing) = growing {
+            let progress = growing.timer.fraction();
+            let scale = ENEMY_MIN_SCALE + (1.0 - ENEMY_MIN_SCALE) * progress;
+            (scale, progress)
+        } else {
+            (1.0, 1.0)
+        };
+
         match enemy.variant {
             EnemyVariant::Floater => {
-                // Draw red circle for floaters
-                gizmos.circle_2d(pos, 20.0, RED);
+                gizmos.circle_2d(pos, ENEMY_RADIUS * scale, RED.with_alpha(alpha));
             }
             EnemyVariant::Seeker => {
                 // Draw orange triangle for seekers
@@ -426,7 +617,7 @@ fn draw_enemies(mut gizmos: Gizmos, query: Query<(&Transform, &Enemy)>) {
 fn check_bubble_enemy_collision(
     mut commands: Commands,
     bubble_query: Query<(Entity, &Transform), With<Bubble>>,
-    mut enemy_query: Query<(Entity, &Transform, &mut Enemy)>,
+    mut enemy_query: Query<(Entity, &Transform, &mut Enemy, Option<&Growing>)>,
 ) {
     let mut destroyed_enemies: Vec<Entity> = Vec::new();
     let mut destroyed_bubbles: Vec<Entity> = Vec::new();
@@ -438,15 +629,20 @@ fn check_bubble_enemy_collision(
 
         let bubble_pos = bubble_transform.translation.truncate();
 
-        for (enemy_entity, enemy_transform, mut enemy) in enemy_query.iter_mut() {
+        for (enemy_entity, enemy_transform, mut enemy, growing) in enemy_query.iter_mut() {
+            // Skip growing enemies
+            if growing.is_some() {
+                continue;
+            }
+
             if destroyed_enemies.contains(&enemy_entity) {
                 continue;
             }
 
             let enemy_pos = enemy_transform.translation.truncate();
 
-            if bubble_pos.distance(enemy_pos) < 30.0 {
-                enemy.health -= 25.0;
+            if bubble_pos.distance(enemy_pos) < ENEMY_RADIUS {
+                enemy.health -= BUBBLE_DAMAGE;
                 destroyed_bubbles.push(bubble_entity);
 
                 if enemy.health <= 0.0 {
@@ -485,9 +681,9 @@ fn handle_ship_border(
 ) {
     if let Ok((mut ship, transform, mut velocity)) = ship_query.get_single_mut() {
         let window = window_query.single();
-        let impact_damage = 10.0; // Fixed damage on impact
-        let bounce_force = 500.0;
-        let border_width = 50.0;
+        let impact_damage = BORDER_DAMAGE; // Fixed damage on impact
+        let bounce_force = BORDER_BOUNCE_FORCE;
+        let border_width = BORDER_WIDTH;
 
         let pos = transform.translation;
         let half_width = window.width() / 2.0 - border_width;
@@ -583,20 +779,6 @@ fn cleanup_gameplay(mut commands: Commands, query: Query<Entity, With<GameplayOb
     }
 }
 
-// Reset timer in setup_game_round
-fn setup_game_round(mut commands: Commands, mut spawn_timer: ResMut<EnemySpawnTimer>) {
-    commands.spawn((
-        Ship { health: 100.0 },
-        Transform::from_xyz(0.0, 0.0, 0.0),
-        Velocity::default(),
-        GameplayObject,
-    ));
-
-    // Reset enemy spawn timer
-    spawn_timer.elapsed_time = 0.0;
-    spawn_timer.timer.set_duration(Duration::from_secs_f32(3.0));
-}
-
 fn handle_starting_state(
     mut timer: ResMut<StartingTimer>,
     mut next_state: ResMut<NextState<GameState>>,
@@ -639,16 +821,21 @@ fn cleanup_get_ready_text(mut commands: Commands, query: Query<Entity, With<GetR
 
 fn handle_ship_enemy_collision(
     mut ship_query: Query<(&mut Ship, &Transform, &mut Velocity)>,
-    enemy_query: Query<&Transform, With<Enemy>>,
+    enemy_query: Query<(&Transform, Option<&Growing>), With<Enemy>>,
 ) {
     if let Ok((mut ship, ship_transform, mut ship_vel)) = ship_query.get_single_mut() {
         let ship_pos = ship_transform.translation.truncate();
-        let collision_radius = 35.0; // Ship radius + Enemy radius
-        let impact_damage = 20.0;
-        let bounce_force = 400.0;
 
-        for enemy_transform in &enemy_query {
+        for (enemy_transform, growing) in &enemy_query {
+            // Skip collision if enemy is still growing
+            if growing.is_some() {
+                continue;
+            }
+
             let enemy_pos = enemy_transform.translation.truncate();
+            let collision_radius = SHIP_RADIUS + ENEMY_RADIUS;
+            let impact_damage = ENEMY_COLLISION_DAMAGE;
+            let bounce_force = ENEMY_COLLISION_FORCE;
 
             if ship_pos.distance(enemy_pos) < collision_radius {
                 // Calculate bounce direction
@@ -676,16 +863,16 @@ fn spawn_ship_explosion(ship_query: Query<&Transform, With<Ship>>, mut commands:
         let mut rng = rand::thread_rng();
 
         // Spawn multiple particles
-        for _ in 0..30 {
+        for _ in 0..EXPLOSION_PARTICLES {
             let angle = rng.gen_range(0.0..std::f32::consts::TAU);
-            let speed = rng.gen_range(100.0..300.0);
+            let speed = rng.gen_range(EXPLOSION_MIN_SPEED..EXPLOSION_MAX_SPEED);
             let velocity = Vec2::new(angle.cos(), angle.sin()) * speed;
 
             commands.spawn((
                 ExplosionParticle {
-                    lifetime: Timer::from_seconds(1.0, TimerMode::Once),
+                    lifetime: Timer::from_seconds(EXPLOSION_LIFETIME, TimerMode::Once),
                     velocity,
-                    size: rng.gen_range(2.0..8.0),
+                    size: rng.gen_range(EXPLOSION_MIN_SIZE..EXPLOSION_MAX_SIZE),
                 },
                 Transform::from_xyz(pos.x, pos.y, 0.0),
                 GameplayObject,
@@ -711,7 +898,7 @@ fn update_explosion(
         } else {
             all_particles_done = false;
             transform.translation += particle.velocity.extend(0.0) * time.delta_secs();
-            particle.velocity *= 0.98; // Add some drag
+            particle.velocity *= EXPLOSION_DRAG;
         }
     }
 
@@ -727,4 +914,54 @@ fn draw_explosion(mut gizmos: Gizmos, query: Query<(&Transform, &ExplosionPartic
         let alpha = particle.lifetime.fraction_remaining();
         gizmos.circle_2d(pos, particle.size, Color::srgba(1.0, 0.5, 0.0, alpha));
     }
+}
+
+// Add system to regenerate bubble supply
+fn regenerate_bubble_supply(mut query: Query<&mut Ship>, time: Res<Time>) {
+    if let Ok(mut ship) = query.get_single_mut() {
+        ship.bubble_supply =
+            (ship.bubble_supply + BUBBLE_REGEN_RATE * time.delta_secs()).min(MAX_BUBBLE_SUPPLY);
+    }
+}
+
+// Add new system for enemy border bouncing
+fn handle_enemy_border(
+    mut enemy_query: Query<(&Transform, &mut Velocity), With<Enemy>>,
+    window_query: Query<&Window>,
+    spawn_timer: Res<EnemySpawnTimer>,
+) {
+    let window = window_query.single();
+    let border_width = BORDER_WIDTH;
+    let half_width = window.width() / 2.0 - border_width;
+    let half_height = window.height() / 2.0 - border_width;
+
+    // Get current speed multiplier
+    let speed_multiplier = get_enemy_speed_multiplier(spawn_timer.elapsed_time);
+    let bounce_speed = ENEMY_BOUNCE_FORCE * speed_multiplier;
+
+    for (transform, mut velocity) in enemy_query.iter_mut() {
+        let pos = transform.translation;
+
+        if pos.x.abs() > half_width || pos.y.abs() > half_height {
+            let to_center = -pos.truncate().normalize();
+            velocity.0 = to_center * bounce_speed;
+        }
+    }
+}
+
+fn setup_game_round(mut commands: Commands, mut spawn_timer: ResMut<EnemySpawnTimer>) {
+    commands.spawn((
+        Ship {
+            health: SHIP_HEALTH,
+            bubble_supply: BUBBLE_MAX_SUPPLY,
+        },
+        Transform::from_xyz(0.0, 0.0, 0.0),
+        Velocity::default(),
+        AimControl::default(),
+        GameplayObject,
+    ));
+
+    // Reset enemy spawn timer
+    spawn_timer.elapsed_time = 0.0;
+    spawn_timer.timer.set_duration(Duration::from_secs_f32(3.0));
 }
