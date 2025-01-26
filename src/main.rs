@@ -7,14 +7,19 @@ use rand::Rng;
 #[derive(States, Debug, Clone, Copy, Eq, PartialEq, Hash, Default)]
 enum GameState {
     #[default]
+    Starting,
     Playing,
     GameOver,
 }
+
+#[derive(Resource, Deref, DerefMut)]
+struct StartingTimer(Timer);
 
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
         .init_state::<GameState>()
+        .insert_resource(StartingTimer(Timer::from_seconds(1.0, TimerMode::Once)))
         .add_systems(Startup, setup)
         .insert_resource(ClearColor(Color::BLACK))
         .insert_resource(Mouse::default())
@@ -34,12 +39,21 @@ fn main() {
                 update_bubble_lifetime,
                 handle_ship_border,
                 check_game_over,
+                handle_ship_enemy_collision,
             )
                 .run_if(in_state(GameState::Playing)),
         )
         .add_systems(OnEnter(GameState::GameOver), spawn_game_over_ui)
         .add_systems(OnExit(GameState::Playing), cleanup_gameplay)
-        .add_systems(OnEnter(GameState::Playing), setup_game_round)
+        .add_systems(
+            OnEnter(GameState::Starting),
+            (setup_game_round, spawn_get_ready_text),
+        )
+        .add_systems(OnExit(GameState::Starting), cleanup_get_ready_text)
+        .add_systems(
+            Update,
+            handle_starting_state.run_if(in_state(GameState::Starting)),
+        )
         .add_systems(
             Update,
             handle_replay_button.run_if(in_state(GameState::GameOver)),
@@ -487,6 +501,7 @@ struct ReplayButton;
 
 fn handle_replay_button(
     mut next_state: ResMut<NextState<GameState>>,
+    mut timer: ResMut<StartingTimer>,
     mut interaction_query: Query<
         (&Interaction, &Parent),
         (Changed<Interaction>, With<ReplayButton>),
@@ -495,7 +510,8 @@ fn handle_replay_button(
 ) {
     for (interaction, parent) in &mut interaction_query {
         if *interaction == Interaction::Pressed {
-            next_state.set(GameState::Playing);
+            next_state.set(GameState::Starting);
+            timer.reset();
             commands.entity(parent.get()).despawn_recursive();
         }
     }
@@ -520,4 +536,68 @@ fn setup_game_round(mut commands: Commands) {
         Velocity::default(),
         GameplayObject,
     ));
+}
+
+fn handle_starting_state(
+    mut timer: ResMut<StartingTimer>,
+    mut next_state: ResMut<NextState<GameState>>,
+    time: Res<Time>,
+) {
+    timer.tick(time.delta());
+    if timer.finished() {
+        next_state.set(GameState::Playing);
+    }
+}
+
+// Add marker component for the get ready text
+#[derive(Component)]
+struct GetReadyText;
+
+// Add system to spawn the get ready text
+fn spawn_get_ready_text(mut commands: Commands) {
+    commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            GetReadyText,
+        ))
+        .with_children(|parent| {
+            parent.spawn(Text::new("Get Ready!"));
+        });
+}
+
+// Add system to cleanup the get ready text
+fn cleanup_get_ready_text(mut commands: Commands, query: Query<Entity, With<GetReadyText>>) {
+    for entity in &query {
+        commands.entity(entity).despawn_recursive();
+    }
+}
+
+fn handle_ship_enemy_collision(
+    mut ship_query: Query<(&mut Ship, &Transform, &mut Velocity)>,
+    enemy_query: Query<&Transform, With<Enemy>>,
+) {
+    if let Ok((mut ship, ship_transform, mut ship_vel)) = ship_query.get_single_mut() {
+        let ship_pos = ship_transform.translation.truncate();
+        let collision_radius = 35.0; // Ship radius + Enemy radius
+        let impact_damage = 20.0;
+        let bounce_force = 400.0;
+
+        for enemy_transform in &enemy_query {
+            let enemy_pos = enemy_transform.translation.truncate();
+
+            if ship_pos.distance(enemy_pos) < collision_radius {
+                // Calculate bounce direction
+                let bounce_dir = (ship_pos - enemy_pos).normalize();
+                ship_vel.0 += bounce_dir * bounce_force;
+                ship.health -= impact_damage;
+                break; // Only handle one collision per frame
+            }
+        }
+    }
 }
