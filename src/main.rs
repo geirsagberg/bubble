@@ -4,9 +4,17 @@ use bevy::prelude::*;
 use rand;
 use rand::Rng;
 
+#[derive(States, Debug, Clone, Copy, Eq, PartialEq, Hash, Default)]
+enum GameState {
+    #[default]
+    Playing,
+    GameOver,
+}
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
+        .init_state::<GameState>()
         .add_systems(Startup, setup)
         .insert_resource(ClearColor(Color::BLACK))
         .insert_resource(Mouse::default())
@@ -23,32 +31,41 @@ fn main() {
                 spawn_enemies,
                 draw_enemies,
                 check_bubble_enemy_collision,
-            ),
+                update_bubble_lifetime,
+                handle_ship_border,
+                check_game_over,
+            )
+                .run_if(in_state(GameState::Playing)),
+        )
+        .add_systems(OnEnter(GameState::GameOver), spawn_game_over_ui)
+        .add_systems(OnExit(GameState::Playing), cleanup_gameplay)
+        .add_systems(OnEnter(GameState::Playing), setup_game_round)
+        .add_systems(
+            Update,
+            handle_replay_button.run_if(in_state(GameState::GameOver)),
         )
         .run();
 }
 
 fn setup(mut commands: Commands) {
     commands.spawn(Camera2d::default());
-
-    commands.spawn((
-        Ship,
-        Transform::from_xyz(0.0, 0.0, 0.0),
-        Velocity(Vec2::ZERO),
-    ));
 }
 
-#[derive(Component)]
+#[derive(Component, Default)]
 struct Velocity(Vec2);
 
 #[derive(Component)]
 struct Bubble {
     color: Color,
     size: f32,
+    lifetime: Timer,
 }
 
 #[derive(Component)]
-struct Ship;
+#[require(Transform, Velocity)]
+struct Ship {
+    health: f32,
+}
 
 #[derive(Component)]
 struct Enemy {
@@ -79,33 +96,37 @@ fn spawn_bubble(
     mouse: Res<Mouse>,
     mouse_button: Res<ButtonInput<MouseButton>>,
 ) {
-    if mouse_button.pressed(MouseButton::Left) {
-        let ship_transform = ship_query.single();
-        let ship_pos = ship_transform.translation.truncate();
-        let mut rng = rand::thread_rng();
+    if let (Ok(ship_transform), Ok(mut ship_vel)) =
+        (ship_query.get_single(), ship_velocity.get_single_mut())
+    {
+        if mouse_button.pressed(MouseButton::Left) {
+            let ship_pos = ship_transform.translation.truncate();
+            let mut rng = rand::thread_rng();
 
-        // Calculate direction to mouse with some randomness
-        let to_mouse = (mouse.position - ship_pos).normalize();
-        let random_angle = rng.gen_range(-0.3..0.3);
-        let direction = Vec2::new(
-            to_mouse.x * (random_angle as f32).cos() - to_mouse.y * (random_angle as f32).sin(),
-            to_mouse.x * (random_angle as f32).sin() + to_mouse.y * (random_angle as f32).cos(),
-        );
-        let speed = rng.gen_range(100.0..200.0);
+            // Calculate direction to mouse with some randomness
+            let to_mouse = (mouse.position - ship_pos).normalize();
+            let random_angle = rng.gen_range(-0.3..0.3);
+            let direction = Vec2::new(
+                to_mouse.x * (random_angle as f32).cos() - to_mouse.y * (random_angle as f32).sin(),
+                to_mouse.x * (random_angle as f32).sin() + to_mouse.y * (random_angle as f32).cos(),
+            );
+            let speed = rng.gen_range(100.0..200.0);
 
-        // Apply recoil to ship
-        let recoil_force = 5.0;
-        let mut ship_vel = ship_velocity.single_mut();
-        ship_vel.0 -= direction * recoil_force;
+            // Apply recoil to ship
+            let recoil_force = 5.0;
+            ship_vel.0 -= direction * recoil_force;
 
-        commands.spawn((
-            Bubble {
-                color: random_pastel_color(),
-                size: rng.gen_range(5.0..15.0),
-            },
-            Transform::from_xyz(ship_pos.x, ship_pos.y, 0.0),
-            Velocity(direction * speed),
-        ));
+            commands.spawn((
+                Bubble {
+                    color: random_pastel_color(),
+                    size: rng.gen_range(5.0..15.0),
+                    lifetime: Timer::from_seconds(rng.gen_range(1.0..2.0), TimerMode::Once),
+                },
+                Transform::from_xyz(ship_pos.x, ship_pos.y, 0.0),
+                Velocity(direction * speed),
+                GameplayObject,
+            ));
+        }
     }
 }
 
@@ -187,80 +208,105 @@ fn move_ship(
     time: Res<Time>,
     window_query: Query<&Window>,
 ) {
-    let (mut transform, mut velocity) = query.single_mut();
-    let window = window_query.single();
-    let half_width = window.width() / 2.0;
-    let half_height = window.height() / 2.0;
+    if let Ok((mut transform, mut velocity)) = query.get_single_mut() {
+        let window = window_query.single();
+        let half_width = window.width() / 2.0;
+        let half_height = window.height() / 2.0;
 
-    let mut acceleration = Vec2::ZERO;
-    let acceleration_rate = 1000.0;
-    let max_speed = 300.0;
-    let friction = 0.98;
+        let mut acceleration = Vec2::ZERO;
+        let acceleration_rate = 1000.0;
+        let max_speed = 300.0;
+        let friction = 0.98;
 
-    if keyboard.pressed(KeyCode::KeyW) {
-        acceleration.y += 1.0;
-    }
-    if keyboard.pressed(KeyCode::KeyS) {
-        acceleration.y -= 1.0;
-    }
-    if keyboard.pressed(KeyCode::KeyA) {
-        acceleration.x -= 1.0;
-    }
-    if keyboard.pressed(KeyCode::KeyD) {
-        acceleration.x += 1.0;
-    }
+        if keyboard.pressed(KeyCode::KeyW) {
+            acceleration.y += 1.0;
+        }
+        if keyboard.pressed(KeyCode::KeyS) {
+            acceleration.y -= 1.0;
+        }
+        if keyboard.pressed(KeyCode::KeyA) {
+            acceleration.x -= 1.0;
+        }
+        if keyboard.pressed(KeyCode::KeyD) {
+            acceleration.x += 1.0;
+        }
 
-    let dt = time.delta_secs();
+        let dt = time.delta_secs();
 
-    if acceleration != Vec2::ZERO {
-        acceleration = acceleration.normalize() * acceleration_rate * dt;
-        velocity.0 += acceleration;
-    }
+        if acceleration != Vec2::ZERO {
+            acceleration = acceleration.normalize() * acceleration_rate * dt;
+            velocity.0 += acceleration;
+        }
 
-    // Apply friction
-    velocity.0 *= friction;
+        // Apply friction
+        velocity.0 *= friction;
 
-    // Clamp maximum speed
-    if velocity.0.length() > max_speed {
-        velocity.0 = velocity.0.normalize() * max_speed;
-    }
+        // Clamp maximum speed
+        if velocity.0.length() > max_speed {
+            velocity.0 = velocity.0.normalize() * max_speed;
+        }
 
-    transform.translation += velocity.0.extend(0.0) * dt;
+        transform.translation += velocity.0.extend(0.0) * dt;
 
-    // Wrap position around screen edges
-    if transform.translation.x > half_width {
-        transform.translation.x = -half_width;
-    } else if transform.translation.x < -half_width {
-        transform.translation.x = half_width;
-    }
+        // Wrap position around screen edges
+        if transform.translation.x > half_width {
+            transform.translation.x = -half_width;
+        } else if transform.translation.x < -half_width {
+            transform.translation.x = half_width;
+        }
 
-    if transform.translation.y > half_height {
-        transform.translation.y = -half_height;
-    } else if transform.translation.y < -half_height {
-        transform.translation.y = half_height;
+        if transform.translation.y > half_height {
+            transform.translation.y = -half_height;
+        } else if transform.translation.y < -half_height {
+            transform.translation.y = half_height;
+        }
     }
 }
 
-fn draw_ship(mut gizmos: Gizmos, query: Query<&Transform, With<Ship>>, mouse: Res<Mouse>) {
-    let transform = query.single();
-    let pos = transform.translation.truncate();
+fn draw_ship(
+    mut gizmos: Gizmos,
+    query: Query<(&Transform, &Ship)>,
+    mouse: Res<Mouse>,
+    window_query: Query<&Window>,
+) {
+    let window = window_query.single();
+    let border_width = 50.0;
 
-    // Draw ship circle
-    gizmos.circle_2d(pos, 15.0, Color::WHITE);
-
-    // Calculate direction to mouse
-    let to_mouse = (mouse.position - pos).normalize();
-
-    // Calculate rectangle points
-    let rect_length = 20.0;
-    let rect_center = pos + to_mouse * 15.0; // Position rectangle at edge of circle
-
-    // Draw rectangle pointing towards mouse
-    gizmos.line_2d(
-        rect_center - to_mouse * rect_length / 2.0,
-        rect_center + to_mouse * rect_length / 2.0,
-        Color::WHITE,
+    // Draw danger border
+    gizmos.rect_2d(
+        Vec2::ZERO, // center position
+        Vec2::new(
+            window.width() - border_width,
+            window.height() - border_width,
+        ), // size
+        Color::srgba(1.0, 0.0, 0.0, 0.2), // color
     );
+
+    if let Ok((transform, ship)) = query.get_single() {
+        let pos = transform.translation.truncate();
+
+        // Calculate ship color based on health (100 -> white, 0 -> dark red)
+        let health_factor = (ship.health / 100.0).clamp(0.0, 1.0);
+        let ship_color = Color::srgb(
+            1.0,           // Red stays at 1.0
+            health_factor, // Green fades with health
+            health_factor, // Blue fades with health
+        );
+
+        // Draw ship circle with health color
+        gizmos.circle_2d(pos, 15.0, ship_color);
+
+        // Draw aim line with same color
+        let to_mouse = (mouse.position - pos).normalize();
+        let rect_length = 20.0;
+        let rect_center = pos + to_mouse * 15.0;
+
+        gizmos.line_2d(
+            rect_center - to_mouse * rect_length / 2.0,
+            rect_center + to_mouse * rect_length / 2.0,
+            ship_color,
+        );
+    }
 }
 
 fn spawn_enemies(mut commands: Commands, time: Res<Time>, window_query: Query<&Window>) {
@@ -282,6 +328,7 @@ fn spawn_enemies(mut commands: Commands, time: Res<Time>, window_query: Query<&W
                 rng.gen_range(-50.0..50.0),
                 rng.gen_range(-50.0..50.0),
             )),
+            GameplayObject,
         ));
     }
 }
@@ -312,23 +359,165 @@ fn check_bubble_enemy_collision(
     bubble_query: Query<(Entity, &Transform), With<Bubble>>,
     mut enemy_query: Query<(Entity, &Transform, &mut Enemy)>,
 ) {
+    let mut destroyed_enemies: Vec<Entity> = Vec::new();
+    let mut destroyed_bubbles: Vec<Entity> = Vec::new();
+
     for (bubble_entity, bubble_transform) in bubble_query.iter() {
+        if destroyed_bubbles.contains(&bubble_entity) {
+            continue;
+        }
+
         let bubble_pos = bubble_transform.translation.truncate();
 
         for (enemy_entity, enemy_transform, mut enemy) in enemy_query.iter_mut() {
+            if destroyed_enemies.contains(&enemy_entity) {
+                continue;
+            }
+
             let enemy_pos = enemy_transform.translation.truncate();
 
             if bubble_pos.distance(enemy_pos) < 30.0 {
-                // Adjust collision radius as needed
-                enemy.health -= 25.0; // Damage from bubble
-                commands.entity(bubble_entity).despawn();
+                enemy.health -= 25.0;
+                destroyed_bubbles.push(bubble_entity);
 
                 if enemy.health <= 0.0 {
-                    commands.entity(enemy_entity).despawn();
+                    destroyed_enemies.push(enemy_entity);
                 }
-
                 break; // Bubble can only hit one enemy
             }
         }
     }
+
+    // Despawn all at once after collision checks
+    for entity in destroyed_bubbles {
+        commands.entity(entity).despawn();
+    }
+    for entity in destroyed_enemies {
+        commands.entity(entity).despawn();
+    }
+}
+
+fn update_bubble_lifetime(
+    mut commands: Commands,
+    mut bubbles: Query<(Entity, &mut Bubble)>,
+    time: Res<Time>,
+) {
+    for (entity, mut bubble) in &mut bubbles {
+        bubble.lifetime.tick(time.delta());
+        if bubble.lifetime.finished() {
+            commands.entity(entity).despawn();
+        }
+    }
+}
+
+fn handle_ship_border(
+    mut ship_query: Query<(&mut Ship, &Transform, &mut Velocity)>,
+    window_query: Query<&Window>,
+) {
+    if let Ok((mut ship, transform, mut velocity)) = ship_query.get_single_mut() {
+        let window = window_query.single();
+        let impact_damage = 10.0; // Fixed damage on impact
+        let bounce_force = 500.0;
+        let border_width = 50.0;
+
+        let pos = transform.translation;
+        let half_width = window.width() / 2.0 - border_width;
+        let half_height = window.height() / 2.0 - border_width;
+
+        // Check if ship just entered the border zone
+        if pos.x.abs() > half_width || pos.y.abs() > half_height {
+            // Only apply damage if ship is moving towards the border
+            let to_center = -pos.truncate().normalize();
+            if velocity.0.dot(to_center) < 0.0 {
+                ship.health -= impact_damage;
+                velocity.0 += to_center * bounce_force;
+            }
+        }
+    }
+}
+
+fn check_game_over(ship_query: Query<&Ship>, mut next_state: ResMut<NextState<GameState>>) {
+    if let Ok(ship) = ship_query.get_single() {
+        if ship.health <= 0.0 {
+            next_state.set(GameState::GameOver);
+        }
+    }
+}
+
+fn spawn_game_over_ui(mut commands: Commands) {
+    commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                flex_direction: FlexDirection::Column,
+                ..default()
+            },
+            BackgroundColor(Color::NONE),
+        ))
+        .with_children(|parent| {
+            // Game Over Text
+            parent.spawn(Text::new("Game Over"));
+
+            // Replay Button
+            parent
+                .spawn((
+                    Button,
+                    Node {
+                        width: Val::Px(150.0),
+                        height: Val::Px(50.0),
+                        margin: UiRect::all(Val::Px(20.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.15, 0.15, 0.15)),
+                    ReplayButton,
+                ))
+                .with_children(|parent| {
+                    parent.spawn(Text::new("Replay"));
+                });
+        });
+}
+
+#[derive(Component)]
+struct ReplayButton;
+
+fn handle_replay_button(
+    mut next_state: ResMut<NextState<GameState>>,
+    mut interaction_query: Query<
+        (&Interaction, &Parent),
+        (Changed<Interaction>, With<ReplayButton>),
+    >,
+    mut commands: Commands,
+) {
+    for (interaction, parent) in &mut interaction_query {
+        if *interaction == Interaction::Pressed {
+            next_state.set(GameState::Playing);
+            commands.entity(parent.get()).despawn_recursive();
+        }
+    }
+}
+
+// Add marker component for gameplay entities
+#[derive(Component)]
+struct GameplayObject;
+
+// Add cleanup system
+fn cleanup_gameplay(mut commands: Commands, query: Query<Entity, With<GameplayObject>>) {
+    for entity in &query {
+        commands.entity(entity).despawn();
+    }
+}
+
+// Add this new system
+fn setup_game_round(mut commands: Commands) {
+    commands.spawn((
+        Ship { health: 100.0 },
+        Transform::from_xyz(0.0, 0.0, 0.0),
+        Velocity::default(),
+        GameplayObject,
+    ));
 }
