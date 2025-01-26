@@ -1,5 +1,5 @@
 use bevy::app::App;
-use bevy::color::palettes::css::{DARK_RED, ORANGE, RED, YELLOW};
+use bevy::color::palettes::css::*;
 use bevy::prelude::*;
 use rand;
 use rand::Rng;
@@ -192,6 +192,57 @@ struct ShipBounced;
 #[derive(Event)]
 struct EnemyHit;
 
+// Update score resource
+#[derive(Resource, Default)]
+struct Score {
+    value: f32,
+    time_points: f32, // Points from surviving
+    kill_points: f32, // Points from destroying enemies
+}
+
+const POINTS_PER_SECOND: u32 = 10;
+const POINTS_PER_ENEMY: u32 = 100;
+
+// Update score systems
+fn update_score(mut score: ResMut<Score>, time: Res<Time>) {
+    let points = time.delta_secs() * POINTS_PER_SECOND as f32;
+    score.time_points += points;
+    score.value = score.time_points + score.kill_points;
+}
+
+fn handle_enemy_destroyed(
+    mut score: ResMut<Score>,
+    mut enemy_destroyed: EventReader<EnemyDestroyed>,
+) {
+    for _ in enemy_destroyed.read() {
+        score.kill_points += POINTS_PER_ENEMY as f32;
+        score.value = score.time_points + score.kill_points;
+    }
+}
+
+// Add score display
+#[derive(Component)]
+struct ScoreText;
+
+fn spawn_score_ui(mut commands: Commands) {
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(10.0),
+            top: Val::Px(10.0),
+            ..default()
+        },
+        ScoreText,
+        Text::new("Score: 0"),
+    ));
+}
+
+fn update_score_display(score: Res<Score>, mut query: Query<&mut Text, With<ScoreText>>) {
+    if let Ok(mut text) = query.get_single_mut() {
+        text.0 = format!("Score: {}", score.value as u32);
+    }
+}
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
@@ -204,6 +255,7 @@ fn main() {
         .add_event::<EnemyDestroyed>()
         .add_event::<ShipBounced>()
         .add_event::<EnemyHit>()
+        .insert_resource(Score::default())
         .add_systems(Startup, setup)
         .insert_resource(ClearColor(Color::BLACK))
         .insert_resource(Mouse::default())
@@ -236,6 +288,10 @@ fn main() {
         )
         .add_systems(
             Update,
+            (update_score, handle_enemy_destroyed).run_if(in_state(GameState::Playing)),
+        )
+        .add_systems(
+            Update,
             (
                 // Draw systems - run during both Playing and Dying
                 draw_ship,
@@ -243,6 +299,7 @@ fn main() {
                 draw_enemies,
                 update_explosion,
                 draw_explosion,
+                update_score_display,
             )
                 .run_if(is_playing_or_dying),
         )
@@ -268,6 +325,7 @@ fn main() {
         )
         .add_systems(Update, handle_exit)
         .add_systems(OnExit(GameState::GameOver), cleanup_game_over_ui)
+        .add_systems(Startup, spawn_score_ui)
         .run();
 }
 
@@ -836,7 +894,6 @@ fn spawn_explosion(commands: &mut Commands, pos: Vec2, explosion_type: Explosion
     }
 }
 
-// Update check_bubble_enemy_collision to spawn explosions
 fn check_bubble_enemy_collision(
     mut commands: Commands,
     bubble_query: Query<(Entity, &Transform), With<Bubble>>,
@@ -967,7 +1024,7 @@ fn spawn_game_over_ui(mut commands: Commands) {
                 ..default()
             },
             BackgroundColor(Color::NONE),
-            GameOverUI, // Add marker component
+            GameOverUI,
         ))
         .with_children(|parent| {
             // Game Over Text
@@ -1243,6 +1300,7 @@ fn setup_game_round(
     mut commands: Commands,
     mut spawn_timer: ResMut<EnemySpawnTimer>,
     mut death_timer: ResMut<DeathTimer>,
+    mut score: ResMut<Score>,
 ) {
     commands.spawn((
         Ship {
@@ -1261,6 +1319,7 @@ fn setup_game_round(
     spawn_timer.timer.set_duration(Duration::from_secs_f32(3.0));
 
     death_timer.reset();
+    *score = Score::default();
 }
 
 fn handle_death_timer(
